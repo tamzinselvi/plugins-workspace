@@ -4,13 +4,15 @@
 
 //! Access the HTTP client written in Rust.
 
-use http::HeaderMap;
+use http::{header, HeaderMap};
 pub use reqwest;
-use std::{future::Future, pin::Pin, sync::Arc};
+use reqwest::redirect::Policy;
+use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
 use tauri::{
     plugin::{Builder, TauriPlugin},
     Manager, Runtime,
 };
+use url::Url;
 
 pub use error::{Error, Result};
 
@@ -188,3 +190,64 @@ pub fn set_middleware<R: Runtime>(app: &tauri::AppHandle<R>, middleware: Arc<dyn
         }
     };
 }
+
+/// Execute a reqwest RequestBuilder with shared middleware.
+/// Caller is responsible for creating both the initial and a retry builder with the same method/body.
+pub async fn execute_with_middleware<R: Runtime>(
+    app: &tauri::AppHandle<R>,
+    request: reqwest::RequestBuilder,
+    retry_request: reqwest::RequestBuilder,
+    url: Url,
+    mut headers: HeaderMap,
+) -> Result<reqwest::Response> {
+    let state: tauri::State<Http> = app.state();
+    let middleware_opt = match state.middleware.lock() {
+        Ok(g) => (*g).clone(),
+        Err(_) => None,
+    };
+
+    if let Some(ref m) = middleware_opt {
+        m.pre_request(&url, &mut headers);
+    }
+
+    let resp = request.headers(headers).send().await?;
+    if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return Ok(resp);
+    }
+
+    if let Some(m) = middleware_opt {
+        if let Some(r2) = m.on_unauthorized(url, retry_request).await {
+            return Ok(r2);
+        }
+    }
+
+    Ok(resp)
+}
+
+/// Execute with a provided middleware snapshot, avoiding any app/state borrows.
+pub async fn execute_with_middleware_opt(
+    middleware_opt: Option<Arc<dyn Middleware>>,
+    request: reqwest::RequestBuilder,
+    retry_request: reqwest::RequestBuilder,
+    url: Url,
+    mut headers: HeaderMap,
+) -> Result<reqwest::Response> {
+    if let Some(ref m) = middleware_opt {
+        m.pre_request(&url, &mut headers);
+    }
+
+    let resp = request.headers(headers).send().await?;
+    if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+        return Ok(resp);
+    }
+
+    if let Some(m) = middleware_opt {
+        if let Some(r2) = m.on_unauthorized(url, retry_request).await {
+            return Ok(r2);
+        }
+    }
+
+    Ok(resp)
+}
+
+// NOTE: keep file end clean

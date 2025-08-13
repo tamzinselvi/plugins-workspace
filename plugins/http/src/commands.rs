@@ -316,7 +316,15 @@ pub async fn fetch<R: Runtime>(
                     request = request.body(data);
                 }
 
-                // Snapshot middleware once to avoid locking across awaits
+                // Build the retry request builder with original body/headers
+                let client_retry = reqwest::Client::new();
+                let mut retry_rb = client_retry.request(method.clone(), retry_url.clone());
+                if let Some(body) = retry_body.clone() {
+                    retry_rb = retry_rb.body(body);
+                }
+                let retry_rb = retry_rb.headers(retry_headers.clone());
+
+                // Snapshot middleware to avoid borrowing `webview` after move
                 let middleware_opt = {
                     match state.middleware.lock() {
                         Ok(g) => (*g).clone(),
@@ -324,37 +332,15 @@ pub async fn fetch<R: Runtime>(
                     }
                 };
 
-                // App-level middleware hook: pre-request (no await)
-                if let Some(ref m) = middleware_opt {
-                    m.pre_request(&url, &mut headers);
-                }
-
-                request = request.headers(headers);
-
-                #[cfg(feature = "tracing")]
-                tracing::trace!("{:?}", request);
-
                 let fut: CancelableResponseFuture = Box::pin(async move {
-                    let mut resp = match request.try_clone() {
-                        Some(req) => req.send().await?,
-                        None => request.send().await?,
-                    };
-
-                    if resp.status() == StatusCode::UNAUTHORIZED {
-                        if let Some(m) = middleware_opt {
-                            // Rebuild a request builder for retry with original body/headers
-                            let client_retry = reqwest::Client::new();
-                            let mut rb = client_retry.request(method.clone(), retry_url.clone());
-                            if let Some(body) = retry_body {
-                                rb = rb.body(body);
-                            }
-                            rb = rb.headers(retry_headers);
-                            if let Some(r2) = m.on_unauthorized(retry_url.clone(), rb).await {
-                                resp = r2;
-                            }
-                        }
-                    }
-
+                    let resp = crate::execute_with_middleware_opt(
+                        middleware_opt,
+                        request,
+                        retry_rb,
+                        url,
+                        headers,
+                    )
+                    .await?;
                     Ok(resp)
                 });
 
