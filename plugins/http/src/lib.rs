@@ -4,7 +4,9 @@
 
 //! Access the HTTP client written in Rust.
 
+use http::HeaderMap;
 pub use reqwest;
+use std::{future::Future, pin::Pin, sync::Arc};
 use tauri::{
     plugin::{Builder, TauriPlugin},
     Manager, Runtime,
@@ -24,6 +26,22 @@ const COOKIES_FILENAME: &str = ".cookies";
 pub(crate) struct Http {
     #[cfg(feature = "cookies")]
     cookies_jar: std::sync::Arc<crate::reqwest_cookie_store::CookieStoreMutex>,
+    middleware: std::sync::Mutex<Option<Arc<dyn Middleware>>>,
+}
+
+/// Middleware hooks to customize request/response handling.
+/// Implemented by the application to add behaviors like auth header injection and token refresh.
+pub trait Middleware: Send + Sync {
+    /// Called before the request is sent; may mutate headers.
+    fn pre_request(&self, url: &url::Url, headers: &mut HeaderMap);
+
+    /// Called when the initial request returned 401 Unauthorized.
+    /// Return Some(response) to replace the response (e.g., after refresh + retry), or None to keep the original 401.
+    fn on_unauthorized<'a>(
+        &'a self,
+        original_url: url::Url,
+        original_request: reqwest::RequestBuilder,
+    ) -> Pin<Box<dyn Future<Output = Option<reqwest::Response>> + Send + 'a>>;
 }
 
 pub fn init<R: Runtime>() -> TauriPlugin<R> {
@@ -58,6 +76,7 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             let state = Http {
                 #[cfg(feature = "cookies")]
                 cookies_jar: std::sync::Arc::new(cookies_jar),
+                middleware: std::sync::Mutex::new(None),
             };
 
             app.manage(state);
@@ -88,4 +107,84 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::fetch_cancel_body,
         ])
         .build()
+}
+
+/// Initialize the plugin with a custom middleware implementation.
+pub fn init_with_middleware<R: Runtime>(middleware: Arc<dyn Middleware>) -> TauriPlugin<R> {
+    Builder::<R>::new("http")
+        .setup({
+            let middleware = middleware.clone();
+            move |app, _| {
+                #[cfg(feature = "cookies")]
+                let cookies_jar = {
+                    use crate::reqwest_cookie_store::*;
+                    use std::fs::File;
+                    use std::io::BufReader;
+
+                    let cache_dir = app.path().app_cache_dir()?;
+                    std::fs::create_dir_all(&cache_dir)?;
+
+                    let path = cache_dir.join(COOKIES_FILENAME);
+                    let file = File::options()
+                        .create(true)
+                        .append(true)
+                        .read(true)
+                        .open(&path)?;
+
+                    let reader = BufReader::new(file);
+                    CookieStoreMutex::load(path.clone(), reader).unwrap_or_else(|_e| {
+                        #[cfg(feature = "tracing")]
+                        tracing::warn!(
+                            "failed to load cookie store: {_e}, falling back to empty store"
+                        );
+                        CookieStoreMutex::new(path, Default::default())
+                    })
+                };
+
+                let state = Http {
+                    #[cfg(feature = "cookies")]
+                    cookies_jar: std::sync::Arc::new(cookies_jar),
+                    middleware: std::sync::Mutex::new(Some(middleware.clone())),
+                };
+
+                app.manage(state);
+
+                Ok(())
+            }
+        })
+        .on_event(|app, event| {
+            #[cfg(feature = "cookies")]
+            if let tauri::RunEvent::Exit = event {
+                let state = app.state::<Http>();
+
+                match state.cookies_jar.request_save() {
+                    Ok(rx) => {
+                        let _ = rx.recv();
+                    }
+                    Err(_e) => {
+                        #[cfg(feature = "tracing")]
+                        tracing::error!("failed to save cookie jar: {_e}");
+                    }
+                }
+            }
+        })
+        .invoke_handler(tauri::generate_handler![
+            commands::fetch,
+            commands::fetch_cancel,
+            commands::fetch_send,
+            commands::fetch_read_body
+        ])
+        .build()
+}
+
+/// Set or replace the middleware after plugin initialization.
+pub fn set_middleware<R: Runtime>(app: &tauri::AppHandle<R>, middleware: Arc<dyn Middleware>) {
+    // Acquire, then drop temporaries before returning
+    {
+        let state: tauri::State<Http> = app.state();
+        let lock = state.middleware.lock();
+        if let Ok(mut guard) = lock {
+            *guard = Some(middleware);
+        }
+    };
 }

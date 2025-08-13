@@ -26,8 +26,7 @@ struct ReqwestResponse(reqwest::Response);
 impl tauri::Resource for ReqwestResponse {}
 
 type CancelableResponseResult = Result<reqwest::Response>;
-type CancelableResponseFuture =
-    Pin<Box<dyn Future<Output = CancelableResponseResult> + Send + Sync>>;
+type CancelableResponseFuture = Pin<Box<dyn Future<Output = CancelableResponseResult> + Send>>;
 
 struct FetchRequest {
     fut: Mutex<CancelableResponseFuture>,
@@ -269,7 +268,7 @@ pub async fn fetch<R: Runtime>(
                     builder = builder.cookie_provider(state.cookies_jar.clone());
                 }
 
-                let mut request = builder.build()?.request(method.clone(), url);
+                let mut request = builder.build()?.request(method.clone(), url.clone());
 
                 // POST and PUT requests should always have a 0 length content-length,
                 // if there is no body. https://fetch.spec.whatwg.org/#http-network-or-cache-fetch
@@ -308,8 +307,26 @@ pub async fn fetch<R: Runtime>(
                     headers.remove(header::ORIGIN);
                 };
 
+                // Keep copies for potential retry on 401
+                let retry_headers = headers.clone();
+                let retry_body = data.clone();
+                let retry_url = url.clone();
+
                 if let Some(data) = data {
                     request = request.body(data);
+                }
+
+                // Snapshot middleware once to avoid locking across awaits
+                let middleware_opt = {
+                    match state.middleware.lock() {
+                        Ok(g) => (*g).clone(),
+                        Err(_) => None,
+                    }
+                };
+
+                // App-level middleware hook: pre-request (no await)
+                if let Some(ref m) = middleware_opt {
+                    m.pre_request(&url, &mut headers);
                 }
 
                 request = request.headers(headers);
@@ -317,7 +334,29 @@ pub async fn fetch<R: Runtime>(
                 #[cfg(feature = "tracing")]
                 tracing::trace!("{:?}", request);
 
-                let fut = async move { request.send().await.map_err(Into::into) };
+                let fut: CancelableResponseFuture = Box::pin(async move {
+                    let mut resp = match request.try_clone() {
+                        Some(req) => req.send().await?,
+                        None => request.send().await?,
+                    };
+
+                    if resp.status() == StatusCode::UNAUTHORIZED {
+                        if let Some(m) = middleware_opt {
+                            // Rebuild a request builder for retry with original body/headers
+                            let client_retry = reqwest::Client::new();
+                            let mut rb = client_retry.request(method.clone(), retry_url.clone());
+                            if let Some(body) = retry_body {
+                                rb = rb.body(body);
+                            }
+                            rb = rb.headers(retry_headers);
+                            if let Some(r2) = m.on_unauthorized(retry_url.clone(), rb).await {
+                                resp = r2;
+                            }
+                        }
+                    }
+
+                    Ok(resp)
+                });
 
                 let mut resources_table = webview.resources_table();
                 let rid = resources_table.add_request(Box::pin(fut));
