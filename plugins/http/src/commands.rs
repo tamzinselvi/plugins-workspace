@@ -5,7 +5,7 @@
 use std::{future::Future, pin::Pin, str::FromStr, sync::Arc, time::Duration};
 
 use http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
-use reqwest::{redirect::Policy, NoProxy};
+use reqwest::{redirect::Policy, tls::Version, NoProxy};
 use serde::{Deserialize, Serialize};
 use tauri::{
     async_runtime::Mutex,
@@ -227,7 +227,10 @@ pub async fn fetch<R: Runtime>(
             )
             .is_allowed(&url)
             {
-                let mut builder = reqwest::ClientBuilder::new();
+                // Force TLS 1.3 for all HTTPS requests.
+                let mut builder = reqwest::ClientBuilder::new()
+                    .min_tls_version(Version::TLS_1_3)
+                    .max_tls_version(Version::TLS_1_3);
 
                 if let Some(danger_config) = danger {
                     #[cfg(not(feature = "dangerous-settings"))]
