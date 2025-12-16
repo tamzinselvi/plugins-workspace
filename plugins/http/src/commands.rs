@@ -2,7 +2,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-License-Identifier: MIT
 
-use std::{future::Future, pin::Pin, str::FromStr, sync::Arc, time::Duration};
+use std::{
+    error::Error as StdError, future::Future, pin::Pin, str::FromStr, sync::Arc, time::Duration,
+};
 
 use http::{header, HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use reqwest::{redirect::Policy, tls::Version, NoProxy};
@@ -228,7 +230,10 @@ pub async fn fetch<R: Runtime>(
             .is_allowed(&url)
             {
                 // Force TLS 1.3 for all HTTPS requests.
+                // If the backend cannot build a TLS 1.3–only client, log the error so callers
+                // can see the underlying cause instead of the generic “builder error”.
                 let mut builder = reqwest::ClientBuilder::new()
+                    .use_rustls_tls()
                     .min_tls_version(Version::TLS_1_3)
                     .max_tls_version(Version::TLS_1_3);
 
@@ -271,7 +276,21 @@ pub async fn fetch<R: Runtime>(
                     builder = builder.cookie_provider(state.cookies_jar.clone());
                 }
 
-                let mut request = builder.build()?.request(method.clone(), url.clone());
+                let client = builder.build().map_err(|e| {
+                    #[cfg(debug_assertions)]
+                    {
+                        // Surface detailed build failures (e.g., TLS version constraints) during dev.
+                        eprintln!("failed to build HTTP client for {}: {e:#?}", url);
+                        let mut src: Option<&dyn StdError> = e.source();
+                        while let Some(s) = src {
+                            eprintln!("  caused by: {s}");
+                            src = s.source();
+                        }
+                    }
+                    Error::Network(e)
+                })?;
+
+                let mut request = client.request(method.clone(), url.clone());
 
                 // POST and PUT requests should always have a 0 length content-length,
                 // if there is no body. https://fetch.spec.whatwg.org/#http-network-or-cache-fetch
