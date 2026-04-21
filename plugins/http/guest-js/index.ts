@@ -108,6 +108,23 @@ export interface DangerousSettings {
 
 const ERROR_REQUEST_CANCELLED = 'Request cancelled'
 
+// READ AI LOCAL PATCH: The fire-and-forget `fetch_cancel` and
+// `fetch_cancel_body` invokes below can reject with
+// `"The resource id N is invalid."` when the abort signal fires after the
+// request/response resource has already been closed by the natural request
+// lifecycle (e.g. a React Query cancellation racing a finished fetch). These
+// are benign cleanup no-ops and should not bubble up as unhandled rejections.
+// Anything else must still propagate.
+const INVALID_RESOURCE_ID_RE = /resource id \d+ is invalid/i
+const isInvalidResourceIdError = (e: unknown): boolean => {
+  if (typeof e === 'string') return INVALID_RESOURCE_ID_RE.test(e)
+  if (e instanceof Error) return INVALID_RESOURCE_ID_RE.test(e.message)
+  return false
+}
+const ignoreInvalidResourceId = (e: unknown): void => {
+  if (!isInvalidResourceIdError(e)) throw e
+}
+
 /**
  * Fetch a resource from the network. It returns a `Promise` that resolves to the
  * `Response` to that `Request`, whether it is successful or not.
@@ -199,7 +216,8 @@ export async function fetch(
     }
   })
 
-  const abort = () => invoke('plugin:http|fetch_cancel', { rid })
+  const abort = () =>
+    invoke('plugin:http|fetch_cancel', { rid }).catch(ignoreInvalidResourceId)
 
   // Optimistically check for abort signal
   // and avoid doing any work after doing intial work on the Rust side
@@ -231,7 +249,9 @@ export async function fetch(
   })
 
   const dropBody = () => {
-    return invoke('plugin:http|fetch_cancel_body', { rid: responseRid })
+    return invoke('plugin:http|fetch_cancel_body', {
+      rid: responseRid
+    }).catch(ignoreInvalidResourceId)
   }
 
   const readChunk = async (
