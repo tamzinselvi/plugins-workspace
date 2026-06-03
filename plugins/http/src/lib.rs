@@ -37,6 +37,9 @@ pub trait Middleware: Send + Sync {
     /// Called before the request is sent; may mutate headers.
     fn pre_request(&self, url: &url::Url, headers: &mut HeaderMap);
 
+    /// Called after every successful response is received (including retries after 401).
+    fn on_response(&self, _response: &reqwest::Response) {}
+
     /// Called when the initial request returned 401 Unauthorized.
     /// Return Some(response) to replace the response (e.g., after refresh + retry), or None to keep the original 401.
     fn on_unauthorized<'a>(
@@ -212,11 +215,15 @@ pub async fn execute_with_middleware<R: Runtime>(
 
     let resp = request.headers(headers).send().await?;
     if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+        if let Some(ref m) = middleware_opt {
+            m.on_response(&resp);
+        }
         return Ok(resp);
     }
 
     if let Some(m) = middleware_opt {
         if let Some(r2) = m.on_unauthorized(url, retry_request).await {
+            m.on_response(&r2);
             return Ok(r2);
         }
     }
@@ -238,11 +245,15 @@ pub async fn execute_with_middleware_opt(
 
     let resp = request.headers(headers).send().await?;
     if resp.status() != reqwest::StatusCode::UNAUTHORIZED {
+        if let Some(ref m) = middleware_opt {
+            m.on_response(&resp);
+        }
         return Ok(resp);
     }
 
     if let Some(m) = middleware_opt {
         if let Some(r2) = m.on_unauthorized(url, retry_request).await {
+            m.on_response(&r2);
             return Ok(r2);
         }
     }
