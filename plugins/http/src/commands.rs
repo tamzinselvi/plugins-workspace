@@ -276,7 +276,7 @@ pub async fn fetch<R: Runtime>(
                     builder = builder.cookie_provider(state.cookies_jar.clone());
                 }
 
-                let client = builder.build().map_err(|e| {
+                let raw_client = builder.build().map_err(|e| {
                     #[cfg(debug_assertions)]
                     {
                         // Surface detailed build failures (e.g., TLS version constraints) during dev.
@@ -290,6 +290,7 @@ pub async fn fetch<R: Runtime>(
                     Error::Network(e)
                 })?;
 
+                let client = crate::build_client_with_middleware(webview.app_handle(), raw_client);
                 let mut request = client.request(method.clone(), url.clone());
 
                 // POST and PUT requests should always have a 0 length content-length,
@@ -329,40 +330,12 @@ pub async fn fetch<R: Runtime>(
                     headers.remove(header::ORIGIN);
                 };
 
-                // Keep copies for potential retry on 401
-                let retry_headers = headers.clone();
-                let retry_body = data.clone();
-                let retry_url = url.clone();
-
                 if let Some(data) = data {
                     request = request.body(data);
                 }
 
-                // Build the retry request builder with original body/headers
-                let client_retry = reqwest::Client::new();
-                let mut retry_rb = client_retry.request(method.clone(), retry_url.clone());
-                if let Some(body) = retry_body.clone() {
-                    retry_rb = retry_rb.body(body);
-                }
-                let retry_rb = retry_rb.headers(retry_headers.clone());
-
-                // Snapshot middleware to avoid borrowing `webview` after move
-                let middleware_opt = {
-                    match state.middleware.lock() {
-                        Ok(g) => (*g).clone(),
-                        Err(_) => None,
-                    }
-                };
-
                 let fut: CancelableResponseFuture = Box::pin(async move {
-                    let resp = crate::execute_with_middleware_opt(
-                        middleware_opt,
-                        request,
-                        retry_rb,
-                        url,
-                        headers,
-                    )
-                    .await?;
+                    let resp = request.headers(headers).send().await?;
                     Ok(resp)
                 });
 

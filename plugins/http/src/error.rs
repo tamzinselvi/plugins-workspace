@@ -43,6 +43,17 @@ pub enum Error {
     Utf8(#[from] std::string::FromUtf8Error),
     #[error("dangerous settings used but are not enabled")]
     DangerousSettings,
+    #[error("middleware error: {0}")]
+    Middleware(String),
+}
+
+impl From<reqwest_middleware::Error> for Error {
+    fn from(e: reqwest_middleware::Error) -> Self {
+        match e {
+            reqwest_middleware::Error::Reqwest(e) => Error::Network(e),
+            reqwest_middleware::Error::Middleware(e) => Error::Middleware(e.to_string()),
+        }
+    }
 }
 
 impl Serialize for Error {
